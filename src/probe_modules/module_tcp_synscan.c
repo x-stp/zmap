@@ -12,9 +12,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
+#include <stddef.h>
+
+#ifndef JA4TS_UNIT_TEST
 #include <unistd.h>
 #include <time.h>
-#include <string.h>
 #include <assert.h>
 #include <math.h>
 #include <errno.h>
@@ -27,6 +30,82 @@
 #include "probe_modules.h"
 #include "packet.h"
 #include "validate.h"
+#endif /* !JA4TS_UNIT_TEST */
+
+#define JA4TS_OPT_EOL    0
+#define JA4TS_OPT_NOP    1
+#define JA4TS_OPT_MSS    2
+#define JA4TS_OPT_WSCALE 3
+
+void compute_ja4ts(const uint8_t *opts, size_t opts_len, uint16_t window,
+		   char *out, size_t out_len)
+{
+	if (!opts) {
+		opts_len = 0;
+	}
+
+	/* TCP options region <= 40 bytes; worst case ~40 kinds * 4 chars ("xxx-") < 200. */
+	char kinds[200];
+	size_t kinds_off = 0;
+	kinds[0] = '\0';
+
+	int have_mss = 0;
+	uint16_t mss_val = 0;
+	int have_wscale = 0;
+	uint8_t wscale_val = 0;
+
+	size_t i = 0;
+	while (i < opts_len) {
+		uint8_t kind = opts[i];
+
+		int n = snprintf(kinds + kinds_off, sizeof(kinds) - kinds_off,
+				 kinds_off == 0 ? "%u" : "-%u", kind);
+		if (n <= 0 || (size_t)n >= sizeof(kinds) - kinds_off) {
+			break;
+		}
+		kinds_off += (size_t)n;
+
+		if (kind == JA4TS_OPT_EOL) {
+			break;
+		}
+		if (kind == JA4TS_OPT_NOP) {
+			i += 1;
+			continue;
+		}
+
+		if (i + 1 >= opts_len) {
+			break;
+		}
+		uint8_t len = opts[i + 1];
+		if (len < 2 || i + len > opts_len) {
+			break;
+		}
+
+		if (kind == JA4TS_OPT_MSS && len == 4 && !have_mss) {
+			mss_val = (uint16_t)(((uint16_t)opts[i + 2] << 8) | opts[i + 3]);
+			have_mss = 1;
+		} else if (kind == JA4TS_OPT_WSCALE && len == 3 && !have_wscale) {
+			wscale_val = opts[i + 2];
+			have_wscale = 1;
+		}
+
+		i += len;
+	}
+
+	if (have_mss && have_wscale) {
+		snprintf(out, out_len, "%u_%s_%u_%u", window, kinds, mss_val,
+			 wscale_val);
+	} else if (have_mss) {
+		snprintf(out, out_len, "%u_%s_%u_00", window, kinds, mss_val);
+	} else if (have_wscale) {
+		snprintf(out, out_len, "%u_%s_00_%u", window, kinds,
+			 wscale_val);
+	} else {
+		snprintf(out, out_len, "%u_%s_00_00", window, kinds);
+	}
+}
+
+#ifndef JA4TS_UNIT_TEST
 
 // defaults
 static uint8_t zmap_tcp_synscan_tcp_header_len = 20;
@@ -39,6 +118,9 @@ probe_module_t module_tcp_synscan;
 static uint16_t num_source_ports;
 static uint8_t os_for_tcp_options;
 static bool rtt_enabled = false;
+static bool ja4ts_enabled = false;
+static bool ja4t_enabled = false;
+static char ja4t_buf[256];
 
 // RTT is encoded in the lower RTT_TIMESTAMP_BITS of the TCP SYN sequence number
 // (XOR'd with validation[0]). The upper RTT_VALIDATION_BITS are used for packet
@@ -98,6 +180,10 @@ static int synscan_global_initialize(struct state_conf *state)
 	while (token) {
 		if (strcmp(token, "rtt") == 0) {
 			rtt_enabled = true;
+		} else if (strcmp(token, "ja4ts") == 0) {
+			ja4ts_enabled = true;
+		} else if (strcmp(token, "ja4t") == 0) {
+			ja4t_enabled = true;
 		} else if (strcmp(token, "smallest-probes") == 0) {
 			if (os_set) {
 				log_fatal("tcp_synscan", "multiple OS options specified in probe-args");
@@ -134,9 +220,11 @@ static int synscan_global_initialize(struct state_conf *state)
 			log_fatal("tcp_synscan",
 				  "unknown probe-arg: \"%s\"; "
 				  "probe-args should be comma-separated and valid options are: "
-				  "an OS option (\"smallest-probes\", \"bsd\", \"linux\", \"windows\"(default)) "
-				  "and optionally \"rtt\" to enable RTT measurement. "
-				  "Examples: --probe-args=windows, --probe-args=rtt, --probe-args=linux,rtt",
+				  "an OS option (\"smallest-probes\", \"bsd\", \"linux\", \"windows\"(default)), "
+				  "optionally \"rtt\" to enable RTT measurement, "
+				  "optionally \"ja4ts\" to emit the JA4TS fingerprint of the SYN-ACK, "
+				  "and optionally \"ja4t\" to emit the JA4T fingerprint of zmap's own SYN. "
+				  "Examples: --probe-args=windows, --probe-args=rtt, --probe-args=linux,rtt, --probe-args=ja4ts,ja4t",
 				  token);
 		}
 		token = strtok(NULL, ",");
@@ -148,18 +236,52 @@ static int synscan_global_initialize(struct state_conf *state)
 	// double-check arithmetic
 	assert(zmap_tcp_synscan_packet_len - zmap_tcp_synscan_tcp_header_len == 34);
 
-	// Warn if "rtt" was explicitly requested as an output field but not enabled via probe-args
-	if (!rtt_enabled && state->raw_output_fields &&
+	// Warn if "rtt" or "ja4ts" was explicitly requested as an output field but not enabled via probe-args
+	bool rtt_output_requested = false;
+	bool ja4ts_output_requested = false;
+	bool ja4t_output_requested = false;
+	if (state->raw_output_fields &&
 	    strcmp(state->raw_output_fields, "*") != 0) {
 		for (int i = 0; i < state->output_fields_len; i++) {
 			if (strcmp(state->output_fields[i], "rtt") == 0) {
-				log_warn("tcp_synscan",
-					 "\"rtt\" is listed in --output-fields but RTT is not enabled; "
-					 "add \"rtt\" to --probe-args to enable it "
-					 "(e.g. --probe-args=rtt or --probe-args=windows,rtt)");
-				break;
+				rtt_output_requested = true;
+				if (!rtt_enabled) {
+					log_warn("tcp_synscan",
+						 "\"rtt\" is listed in --output-fields but RTT is not enabled; "
+						 "add \"rtt\" to --probe-args to enable it");
+				}
+			}
+			if (strcmp(state->output_fields[i], "ja4ts") == 0) {
+				ja4ts_output_requested = true;
+			    	if (!ja4ts_enabled) {
+			    		log_warn("tcp_synscan",
+						     "\"ja4ts\" is listed in --output-fields but JA4TS is not enabled; "
+						     "add \"ja4ts\" to --probe-args to enable it");
+			    	}
+			}
+			if ( strcmp(state->output_fields[i], "ja4t") == 0) {
+				ja4t_output_requested = true;
+				if (!ja4t_enabled) {
+					log_warn("tcp_synscan",
+						 "\"ja4t\" is listed in --output-fields but JA4T is not enabled; "
+						 "add \"ja4t\" to --probe-args to enable it");
+				}
 			}
 		}
+	} else if (state->raw_output_fields && strcmp(state->raw_output_fields, "*") == 0) {
+		// All output fields requested
+		rtt_output_requested = true;
+		ja4ts_output_requested = true;
+		ja4t_output_requested = true;
+	}
+	if (rtt_enabled && !rtt_output_requested) {
+		log_warn("tcp_synscan", "RTT measurement enabled through --probe-args but not requested in --output-fields. You may want to add --output-fields=\"...,rtt\"");
+	}
+	if (ja4ts_enabled && !ja4ts_output_requested) {
+		log_warn("tcp_synscan", "JA4TS enabled through --probe-args but not requested in --output-fields. You may want to add --output-fields=\"...,ja4ts\"");
+	}
+	if (ja4t_enabled && !ja4t_output_requested) {
+		log_warn("tcp_synscan", "JA4T enabled through --probe-args but not requested in --output-fields. You may want to add --output-fields=\"...,ja4t\"");
 	}
 
 	if (rtt_enabled) {
@@ -189,6 +311,14 @@ static int synscan_prepare_packet(void *buf, macaddr_t *src, macaddr_t *gw,
 	struct tcphdr *tcp_header = (struct tcphdr *)(&ip_header[1]);
 	make_tcp_header(tcp_header, TH_SYN);
 	set_tcp_options(tcp_header, os_for_tcp_options);
+	if (ja4t_enabled) {
+		size_t opts_len = zmap_tcp_synscan_tcp_header_len > 20
+			? zmap_tcp_synscan_tcp_header_len - 20
+			: 0;
+		const uint8_t *opts = (const uint8_t *)tcp_header + 20;
+		compute_ja4ts(opts, opts_len, ntohs(tcp_header->th_win),
+			      ja4t_buf, sizeof(ja4t_buf));
+	}
 	return EXIT_SUCCESS;
 }
 
@@ -482,6 +612,44 @@ static void synscan_process_packet(const u_char *packet, UNUSED uint32_t len,
 		} else {
 			fs_add_null(fs, "rtt");
 		}
+		if (ja4ts_enabled) {
+			if (tcp->th_flags & TH_RST) {
+				fs_add_null(fs, "ja4ts");
+			} else {
+				char ja4ts_buf[256];
+				size_t header_size = tcp->th_off * 4;
+				size_t opts_len = header_size > 20
+					? header_size - 20
+					: 0;
+				const uint8_t *opts =
+				    (const uint8_t *)tcp + 20;
+				compute_ja4ts(opts, opts_len,
+					      ntohs(tcp->th_win), ja4ts_buf,
+					      sizeof(ja4ts_buf));
+				char *ja4ts_str = strdup(ja4ts_buf);
+				if (ja4ts_str) {
+					fs_add_string(fs, "ja4ts", ja4ts_str, 1);
+				} else {
+					log_warn("tcp_synscan",
+						 "failed to allocate memory for JA4TS string, adding null JA4TS field");
+					fs_add_null(fs, "ja4ts");
+				}
+			}
+		} else {
+			fs_add_null(fs, "ja4ts");
+		}
+		if (ja4t_enabled) {
+			char *ja4t_str = strdup(ja4t_buf);
+			if (ja4t_str) {
+				fs_add_string(fs, "ja4t", ja4t_str, 1);
+			} else {
+				log_warn("tcp_synscan",
+					 "failed to allocate memory for JA4T string, adding null JA4T field");
+				fs_add_null(fs, "ja4t");
+			}
+		} else {
+			fs_add_null(fs, "ja4t");
+		}
 	} else if (ip_hdr->ip_p == IPPROTO_ICMP) {
 		// tcp
 		fs_add_null(fs, "sport");
@@ -501,6 +669,8 @@ static void synscan_process_packet(const u_char *packet, UNUSED uint32_t len,
 		fs_populate_icmp_from_iphdr(ip_hdr, len, fs);
 		// rtt
 		fs_add_null(fs, "rtt");
+		fs_add_null(fs, "ja4ts");
+		fs_add_null(fs, "ja4t");
 	}
 }
 
@@ -518,6 +688,10 @@ static fielddef_t fields[] = {
     CLASSIFICATION_SUCCESS_FIELDSET_FIELDS,
     ICMP_FIELDSET_FIELDS,
     {.name = "rtt", .type = "string", .desc = "RTT in ms to one decimal place, max RTT reliably measured = ~28min"},
+    {.name = "ja4ts", .type = "string",
+     .desc = "JA4TS fingerprint of SYN-ACK: window_options_mss_wscale (see FoxIO JA4T)"},
+    {.name = "ja4t", .type = "string",
+     .desc = "JA4T fingerprint of zmap's own SYN: window_options_mss_wscale (see FoxIO JA4T); constant per scan"},
 };
 
 probe_module_t module_tcp_synscan = {
@@ -544,8 +718,12 @@ probe_module_t module_tcp_synscan = {
 		"   - \"bsd\" (MSS + NOP + WindowScale=6 + Timestamps + SACK)\n"
 		"   - \"smallest-probes\" (MSS only, fits minimum Ethernet payload, gives a better hitrate than no options while retaining the same send performance)\n"
 	        " 2. Add \"rtt\" to enable RTT measurement to reports RTT in ms to 0.1 ms granularity (max ~28 min RTT).\n"
+		" 3. Add \"ja4ts\" to emit the JA4TS TCP fingerprint of the SYN-ACK.\n"
+		" 4. Add \"ja4t\" to emit the JA4T TCP fingerprint of zmap's own SYN (constant per scan).\n"
 	"Examples: --probe-args=windows, --probe-args=rtt (windows + RTT), "
-	"--probe-args=linux,rtt. RTT works best with --batch 1. ",
+	"--probe-args=linux,rtt, --probe-args=ja4ts,ja4t. RTT works best with --batch 1. ",
     .output_type = OUTPUT_TYPE_STATIC,
     .fields = fields,
     .numfields = sizeof(fields) / sizeof(fields[0])};
+
+#endif /* !JA4TS_UNIT_TEST */
